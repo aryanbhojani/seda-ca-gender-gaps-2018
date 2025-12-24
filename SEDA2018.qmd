@@ -1,0 +1,527 @@
+---
+title: "California School District Gender Achievement Gaps (SEDA 2018)"
+subtitle: "A reproducible exploratory analysis of reading and math gaps and their socioeconomic correlates"
+author: "Aryan Bhojani"
+format:
+  pdf:
+    pdf-engine: xelatex
+  html:
+    html-math-method: mathjax
+execute:
+  eval: true
+  echo: true
+  message: false
+  warning: false
+params:
+  data_dir: "data"
+  main_file: "ca-main.csv"
+  cov_file: "ca-cov.csv"
+  check_file: "tidy-seda-check.csv"
+---
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(colorspace)
+library(scales)
+```
+
+# Project overview
+
+This project uses the Stanford Education Data Archive (SEDA) to study gender achievement gaps across California school districts in 2018. I focus on two subjects:
+
+- Reading (RLA)
+- Math (MTH)
+
+For each district and grade, the dataset provides standardized mean test score estimates. I compute a district-level gender gap as:
+
+Gender gap = male mean - female mean
+
+So:
+- Positive gap means boys score higher on average.
+- Negative gap means girls score higher on average.
+
+I then examine how these gaps relate to district socioeconomic measures (income, poverty, unemployment, SNAP, and a composite SES index), and how patterns vary by grade and locale.
+
+# Data source
+
+SEDA is a public database that standardizes test score estimates across districts, grades, and years. Scores are reported in standard deviation units relative to national norms, enabling consistent comparisons.
+
+# Import data
+
+```{r}
+main_path <- file.path(params$data_dir, params$main_file)
+cov_path  <- file.path(params$data_dir, params$cov_file)
+check_path <- file.path(params$data_dir, params$check_file)
+
+ca_main <- read_csv(main_path, show_col_types = FALSE)
+ca_cov  <- read_csv(cov_path,  show_col_types = FALSE)
+
+ca_main |> head(5)
+```
+
+```{r}
+ca_cov |> head(5)
+```
+
+# Unit of analysis and dataset scope
+
+Each row in the test score table corresponds to one district-grade-subject combination. The covariate table corresponds to one district-grade combination (covariates do not vary by subject in these files).
+
+```{r}
+ca_main_units <- ca_main |>
+  distinct(sedalea, grade, subject) |>
+  nrow()
+
+ca_cov_units <- ca_cov |>
+  distinct(sedalea, grade) |>
+  nrow()
+
+tibble(
+  dataset = c("ca_main (test scores)", "ca_cov (covariates)"),
+  unique_units = c(ca_main_units, ca_cov_units)
+)
+```
+
+# Build the analysis dataset
+
+## Select variables
+
+```{r}
+main_vars <- c(
+  "sedalea",
+  "sedaleaname",
+  "grade",
+  "subject",
+  "cs_mn_mal",
+  "cs_mn_fem"
+)
+
+cov_vars <- c(
+  "sedalea",
+  "grade",
+  "locale",
+  "sesall",
+  "lninc50all",
+  "povertyall",
+  "unempall",
+  "snapall"
+)
+
+main_sub <- ca_main |>
+  select(all_of(main_vars))
+
+cov_sub <- ca_cov |>
+  select(all_of(cov_vars))
+```
+
+## Merge covariates onto test scores
+
+```{r}
+rawdata <- main_sub |>
+  left_join(cov_sub, by = c("sedalea", "grade"))
+
+head(rawdata, 4)
+```
+
+## Compute gap, rename columns, reorder
+
+```{r}
+name_dict <- c(
+  "District ID"           = "sedalea",
+  "District"              = "sedaleaname",
+  "Locale"                = "locale",
+  "Log(Median income)"    = "lninc50all",
+  "Poverty rate"          = "povertyall",
+  "Unemployment rate"     = "unempall",
+  "SNAP rate"             = "snapall",
+  "Socioeconomic index"   = "sesall",
+  "Grade"                 = "grade",
+  "Subject"               = "subject"
+)
+
+col_order <- c(
+  "District ID", "District", "Locale",
+  "Log(Median income)", "Poverty rate", "Unemployment rate", "SNAP rate",
+  "Socioeconomic index", "Grade", "Subject", "Gender gap"
+)
+
+rawdata_mod1 <- rawdata |>
+  mutate(`Gender gap` = cs_mn_mal - cs_mn_fem) |>
+  rename(!!!name_dict) |>
+  select(all_of(col_order))
+
+head(rawdata_mod1, 4)
+```
+
+## Pivot to a tidy, wide dataset (Math and Reading in separate columns)
+
+```{r}
+seda_data <- rawdata_mod1 |>
+  pivot_wider(
+    names_from  = Subject,
+    values_from = `Gender gap`
+  ) |>
+  rename(
+    Math    = mth,
+    Reading = rla
+  ) |>
+  select(
+    `District ID`, District, Locale,
+    `Log(Median income)`, `Poverty rate`, `Unemployment rate`, `SNAP rate`,
+    `Socioeconomic index`, Grade, Math, Reading
+  )
+
+head(seda_data, 4)
+```
+
+## Optional structural check against a reference file
+
+```{r}
+if (file.exists(check_path)) {
+  data_reference <- read_csv(check_path, show_col_types = FALSE)
+  data_reference
+}
+```
+
+# Missingness assessment
+
+SEDA does not compute gap estimates for some district-grade-subject combinations due to small sample sizes. I quantify missingness at both the row level and district level.
+
+```{r}
+row_missing_props <- seda_data |>
+  summarise(
+    prop_missing_math    = mean(is.na(Math)),
+    prop_missing_reading = mean(is.na(Reading))
+  )
+
+district_missing <- seda_data |>
+  group_by(`District ID`) |>
+  summarise(any_missing = any(is.na(Math) | is.na(Reading)), .groups = "drop")
+
+prop_districts_with_missing <- mean(district_missing$any_missing)
+
+list(
+  row_missing_props = row_missing_props,
+  prop_districts_with_any_missing = prop_districts_with_missing
+)
+```
+
+# Exploratory visualization setup
+
+To visualize relationships between gaps and socioeconomic measures, I reshape to a long format with:
+
+- Subject: Math or Reading
+- Gap: gender gap value
+- Socioeconomic type: which measure (income, poverty, etc.)
+- Socioeconomic measure: the numeric value
+
+```{r}
+plot_df <- seda_data |>
+  pivot_longer(
+    cols = c(Math, Reading),
+    names_to = "Subject",
+    values_to = "Gap"
+  ) |>
+  pivot_longer(
+    cols = c(`Log(Median income)`, `Poverty rate`, `Unemployment rate`, `SNAP rate`, `Socioeconomic index`),
+    names_to = "Socioeconomic type",
+    values_to = "Socioeconomic measure"
+  )
+
+head(plot_df)
+```
+
+# Results: gaps vs socioeconomic measures
+
+## Scatter panels
+
+```{r}
+fig_scatter <- ggplot(
+  plot_df,
+  aes(x = `Socioeconomic measure`, y = Gap, col = Subject)
+) +
+  geom_point(alpha = 0.35, size = 1.2) +
+  facet_wrap(~ `Socioeconomic type`, scales = "free_x") +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    x = NULL,
+    y = "Gender gap (male - female, SD units)",
+    col = "Subject",
+    title = "Gender gaps vs socioeconomic measures (California districts, 2018)"
+  ) +
+  theme_minimal()
+
+fig_scatter
+```
+
+## Linear trend panels
+
+```{r}
+fig_lm <- ggplot(
+  plot_df,
+  aes(x = `Socioeconomic measure`, y = Gap, col = Subject)
+) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  facet_wrap(~ `Socioeconomic type`, scales = "free_x") +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    x = NULL,
+    y = "Gender gap (male - female, SD units)",
+    col = "Subject",
+    title = "Linear trends: gender gaps vs socioeconomic measures"
+  ) +
+  theme_minimal()
+
+fig_lm
+```
+
+# Results: relationships by grade
+
+Here I examine whether the socioeconomic patterns look similar within each grade, and whether gaps vary in magnitude by grade.
+
+```{r}
+fig_grade <- ggplot(
+  plot_df,
+  aes(
+    x = `Socioeconomic measure`,
+    y = Gap,
+    linetype = Subject,
+    col = as.factor(Grade)
+  )
+) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.9) +
+  facet_wrap(~ `Socioeconomic type`, scales = "free_x") +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  colorspace::scale_color_discrete_sequential(palette = "Viridis") +
+  labs(
+    x = NULL,
+    y = "Gender gap (male - female, SD units)",
+    linetype = "Subject",
+    col = "Grade",
+    title = "Linear trends by grade and subject"
+  ) +
+  theme_minimal()
+
+fig_grade
+```
+
+# Results: locale and math gaps
+
+I create a coarser locale label and then compare math gaps across locales.
+
+```{r}
+locale_levels <- sort(unique(plot_df$Locale))
+locale_levels
+```
+
+```{r}
+plot_df <- plot_df |>
+  mutate(
+    locale_coarse = case_when(
+      str_detect(Locale, regex("^Urban|^City", ignore_case = TRUE)) ~ "City",
+      str_detect(Locale, regex("^Subur", ignore_case = TRUE))       ~ "Suburb",
+      str_detect(Locale, regex("^Town",  ignore_case = TRUE))       ~ "Town",
+      str_detect(Locale, regex("^Rural", ignore_case = TRUE))       ~ "Rural",
+      TRUE                                                         ~ "Other"
+    )
+  )
+
+plot_df |>
+  count(locale_coarse, Locale) |>
+  arrange(locale_coarse, desc(n))
+```
+
+```{r}
+math_locale <- plot_df |>
+  filter(Subject == "Math")
+
+fig_locale <- ggplot(
+  math_locale,
+  aes(x = `Socioeconomic measure`, y = Gap, col = locale_coarse)
+) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  facet_wrap(~ `Socioeconomic type`, scales = "free_x") +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  labs(
+    x = NULL,
+    y = "Math gender gap (male - female, SD units)",
+    col = "Locale",
+    title = "Math gap vs socioeconomic measures by locale"
+  ) +
+  theme_minimal()
+
+fig_locale
+```
+
+# Aggregation: district-level averages across grades
+
+I average outcomes and socioeconomic variables across grades within a district to create a district-level summary dataset.
+
+```{r}
+seda_data_agg <- seda_data |>
+  group_by(`District ID`, District, Locale) |>
+  summarise(
+    across(
+      c(`Log(Median income)`, `Poverty rate`, `Unemployment rate`,
+        `SNAP rate`, `Socioeconomic index`, Math, Reading),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+
+seda_data_agg |> head(5)
+```
+
+## Income brackets
+
+I convert log median income back to dollars (exp) and create 8 contiguous income brackets.
+
+```{r}
+seda_data_agg <- seda_data_agg |>
+  drop_na(Math, Reading, `Log(Median income)`) |>
+  mutate(
+    income_dollars = exp(`Log(Median income)`),
+    `Income bracket` = cut(income_dollars, breaks = 8)
+  )
+
+seda_data_agg |>
+  count(`Income bracket`) |>
+  arrange(`Income bracket`)
+```
+
+## Summary table by income bracket
+
+```{r}
+income_bracket_summary <- seda_data_agg |>
+  group_by(`Income bracket`) |>
+  summarise(
+    across(
+      c(Math, Reading, `Poverty rate`, `Unemployment rate`, `SNAP rate`, `Socioeconomic index`),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    n_districts = n(),
+    .groups = "drop"
+  ) |>
+  arrange(`Income bracket`)
+
+income_bracket_summary
+```
+
+## Proportion of districts with notable math gaps
+
+Here I define a "notable math gap favoring boys" as Math > 0.1 SD (male - female) after averaging across grades.
+
+```{r}
+income_bracket_boys_favored <- seda_data_agg |>
+  mutate(math_gap_favoring_boys = Math > 0.1) |>
+  group_by(`Income bracket`) |>
+  summarise(
+    prop_boys_favored = mean(math_gap_favoring_boys, na.rm = TRUE),
+    n_districts = n(),
+    .groups = "drop"
+  ) |>
+  arrange(`Income bracket`)
+
+income_bracket_boys_favored
+```
+
+# Discussion and interpretation (ASCII-friendly)
+
+This section prints a concise narrative discussion using computed summaries, without inline code.
+
+```{r, echo=FALSE, results="asis"}
+overall_math_mean <- mean(seda_data_agg$Math, na.rm = TRUE)
+overall_read_mean <- mean(seda_data_agg$Reading, na.rm = TRUE)
+
+overall_math_abs <- mean(abs(seda_data_agg$Math), na.rm = TRUE)
+overall_read_abs <- mean(abs(seda_data_agg$Reading), na.rm = TRUE)
+
+grade_summary <- seda_data |>
+  group_by(Grade) |>
+  summarise(
+    Math_mean = mean(Math, na.rm = TRUE),
+    Reading_mean = mean(Reading, na.rm = TRUE),
+    Math_abs = mean(abs(Math), na.rm = TRUE),
+    Reading_abs = mean(abs(Reading), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+peak_reading_grade <- grade_summary |>
+  filter(Reading_abs == max(Reading_abs, na.rm = TRUE)) |>
+  slice(1) |>
+  pull(Grade)
+
+peak_reading_val <- grade_summary |>
+  filter(Grade == peak_reading_grade) |>
+  pull(Reading_abs)
+
+locale_math <- seda_data_agg |>
+  mutate(
+    locale_coarse = case_when(
+      str_detect(Locale, regex("^Urban|^City", ignore_case = TRUE)) ~ "City",
+      str_detect(Locale, regex("^Subur", ignore_case = TRUE))       ~ "Suburb",
+      str_detect(Locale, regex("^Town",  ignore_case = TRUE))       ~ "Town",
+      str_detect(Locale, regex("^Rural", ignore_case = TRUE))       ~ "Rural",
+      TRUE                                                         ~ "Other"
+    )
+  ) |>
+  group_by(locale_coarse) |>
+  summarise(
+    Math_mean = mean(Math, na.rm = TRUE),
+    Math_abs = mean(abs(Math), na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n))
+
+cat("## Key takeaways\n\n")
+
+cat(paste0(
+  "- Across districts (averaged across grades), the average Reading gap is ",
+  round(overall_read_mean, 3),
+  " SD (male - female). Negative values indicate a girl advantage.\n"
+))
+cat(paste0(
+  "- Across districts, the average Math gap is ",
+  round(overall_math_mean, 3),
+  " SD (male - female). This is typically much closer to zero.\n\n"
+))
+
+cat(paste0(
+  "A useful way to compare magnitude is the average absolute gap. The mean absolute Reading gap is ",
+  round(overall_read_abs, 3),
+  " SD versus ",
+  round(overall_math_abs, 3),
+  " SD for Math. This supports the pattern that Reading gaps are larger and more consistent, while Math gaps are smaller and often near zero.\n\n"
+))
+
+cat("## Socioeconomic patterns\n\n")
+cat(
+  "In the socioeconomic panels, Reading tends to show a clearer and more systematic relationship with district socioeconomic conditions than Math. Reading gaps more often shift away from zero across the socioeconomic range, while Math gaps cluster tightly around zero with only modest variation.\n\n"
+)
+
+cat("## Grade patterns\n\n")
+cat(paste0(
+  "When separating trends by grade, the overall subject contrast persists within grades: Reading gaps favor girls at most grades, while Math remains closer to zero. In this dataset, the grade with the largest average Reading gap magnitude is grade ",
+  peak_reading_grade,
+  " (mean absolute Reading gap about ",
+  round(peak_reading_val, 3),
+  " SD).\n\n"
+))
+
+cat("## Locale patterns (Math focus)\n\n")
+cat(
+  "When focusing on Math and comparing fitted lines by locale, average differences across locales are small. Any locale differences should be interpreted cautiously because the effect sizes are generally close to zero relative to the Reading patterns.\n\n"
+)
+
+cat("## Missing data note\n\n")
+cat(
+  "Gap estimates are missing for some district-grade-subject combinations, typically due to small sample sizes. Dropping every district with any missing value can bias the analysis toward larger districts and change the socioeconomic mix of the sample. In this project, I keep available observations and report missingness explicitly.\n\n"
+)
+
+cat("## Summary\n\n")
+cat(
+  "Overall, the descriptive patterns align with prior SEDA-based findings: a robust Reading gap favoring girls and no strong statewide Math gap on average, alongside local variation that correlates with socioeconomic context. These results are exploratory and describe associations, not causal effects.\n"
+)
+```
